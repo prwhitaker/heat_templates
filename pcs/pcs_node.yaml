@@ -35,3 +35,7 @@ resources:
         - network: '11111111-1111-1111-1111-111111111111'
         - port: { get_resource: "cluster_server_port" }
       key_name: { get_param: "ssh_key" }
+
+outputs:
+  OS::stack_id:
+    value: { get_resource: cluster_server }
