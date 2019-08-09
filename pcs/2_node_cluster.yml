@@ -39,7 +39,6 @@ parameters:
     description: Name of existing SSH Key to use on all servers
     type: string
 
-
 resources:
   hauser_passwd:
     type: OS::Heat::RandomString
