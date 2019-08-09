@@ -1,0 +1,221 @@
+heat_template_version: 2015-10-15
+
+description: |
+ #### Dev
+ Hopefully it will make a PCS cluster one day
+
+parameters:
+  storage_network:
+    label: ID of network for storage (iscsi)
+    type: string
+    default: eltest
+    constraints:
+      - allowed_values:
+        - el-docker-network
+        - eltest
+        - aleglusnet
+        - rafa9006
+  cluster_network:
+    label: ID of network for cluster comms
+    type: string
+    default: aleglusnet
+    constraints:
+      - allowed_values:
+        - el-docker-network
+        - eltest
+        - aleglusnet
+        - rafa9006   
+  server_image:
+    label: Operating System
+    description: |
+      Server image used for all servers created as part of the deployment
+    type: string
+    default: CentOS 7 (PVHVM) (Orchestration)
+    constraints:
+      - allowed_values:
+        - CentOS 7 (PVHVM) (Orchestration)
+  ssh_key:
+    label: SSH Key
+    description: Name of existing SSH Key to use on all servers
+    type: string
+
+
+resources:
+  hauser_passwd:
+    type: OS::Heat::RandomString
+    properties:
+      length: 16
+  storage_config:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      inputs:
+      - name: server1_name
+      - name: server2_name
+      - name: storage_network
+      config: |
+        #!/bin/sh
+        firewall-cmd --permanent --zone=trusted --add-interface=$storage_network
+        firewall-cmd --zone=trusted --add-interface=$storage_network
+        yum -y install targetcli
+        systemctl enable target
+        systemctl start target
+        fallocate -l 10G /block_storage
+        targetcli /backstores/fileio create name=block_storage file_or_dev=/block_storage
+        targetcli /iscsi create iqn.2008-09.com.rackspace:pcsiscsi.target1
+        targetcli /iscsi/iqn.2008-09.com.rackspace:pcsiscsi.target1/tpg1/luns create /backstores/fileio/block_storage
+        targetcli /iscsi/iqn.2008-09.com.rackspace:pcsiscsi.target1/tpg1/acls create iqn.2008-09.com.rackspace:$server1_name
+        targetcli /iscsi/iqn.2008-09.com.rackspace:pcsiscsi.target1/tpg1/acls create iqn.2008-09.com.rackspace:$server2_name
+  node_config:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      inputs:
+      - name: server1_name
+      - name: server2_name
+      - name: server1_ip
+      - name: server2_ip
+      - name: server_storage_ip
+      - name: storage_network
+      - name: cluster_network
+      - name: ha_password
+      config: |
+        #!/bin/sh
+        echo "$server_ip1 $server1_name-pcs" >> /etc/hosts
+        echo "$server_ip2 $server2_name-pcs" >> /etc/hosts
+        firewall-cmd --permanent --zone=trusted --add-interface=$storage_network
+        firewall-cmd --permanent --zone=trusted --add-interface=$cluster_network
+        firewall-cmd --zone=trusted --add-interface=$storage_network
+        firewall-cmd --zone=trusted --add-interface=$cluster_network
+        yum -y install iscsi-initiator-utils pcs dlm lvm2-cluster python2-pip
+        echo "InitiatorName=iqn.2008-09.com.rackspace:$HOSTNAME" > /etc/iscsi/initiatorname.iscsi
+        iscsiadm -m discovery -t sendtargets -p $server_storage_ip
+        iscsiadm -m node --login
+        echo "exclude=kernel* pcs* corosync* fence-agents* pacemaker* dlm* lvm2* device-mapper*" >> /etc/yum.conf
+        curl https://raw.githubusercontent.com/beekhof/fence_openstack/master/fence_openstack -o /usr/sbin/fence_openstack
+        sed -i 's/ACTIVE).*nova.*action /&--hard /g' /usr/sbin/fence_openstack
+        sed -i 's/--os-auth-url $os_auth.*/--os-auth-url $os_auth --os-region-name $os_region --os-auth-system rackspace"/' /usr/sbin/fence_openstack
+        chmod +x /usr/sbin/fence_openstack
+        pip install python-novaclient==6.0
+        pip install rackspace-novaclient
+        echo "$ha_password" | passwd -stdin hacluster
+        systemctl enable pcsd
+        systemctl start pcsd
+        systemctl stop lvm2-lvmetad.service lvm2-lvmetad.socket
+        systemctl disable lvm2-lvmetad.service lvm2-lvmetad.socket
+        systemctl mask lvm2-lvmetad.service lvm2-lvmetad.socket
+  storage_server_deployment:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      config:
+        get_resource: storage_server_config
+      server:
+        get_resource: storage_server
+      input_values:
+        server1_name: { get_resource: "cluster_server_1" }
+        server2_name: { get_resource: "cluster_server_2" }
+        storage_network: { get_resource: [ storage_server_port, subnets, 0, cidr ] }
+      actions: [ 'CREATE' ]
+  cluster_servers_deployment:
+    type: OS::Heat::SoftwareDeploymentGroup
+    properties:
+      config:
+        get_resource: node_config
+      servers:
+        get_resource: cluster_server_1
+        get_resource: cluster_server_2
+      input_values:
+        server1_name: { get_resource: "cluster_server_1" }
+        server2_name: { get_resource: "cluster_server_2" }
+        storage_network: { get_resource: [ storage_server_port, subnets, 0, cidr ] }
+        cluster_network: { get_resource: [ cluster_server_1_port, subnets, 0, cidr ] }
+        server1_ip: { get_resource: [ cluster_server_1_port, fixed_ips, 0 ] }
+        server2_ip: { get_resource: [ cluster_server_2_port, fixed_ips, 0 ] }
+        server_storage_ip: { get_resource: [ storage_server_port, fixed_ips, 0 ] }
+        ha_password: { get_resource: hauser_password }
+  storage_server_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_param: "storage_network" }
+  cluster_server_1_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_param: "cluster_network" }
+  cluster_server_2_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_param: "cluster_network" }
+  server_storage:
+    type: OS::Nova::Server
+    properties:
+      name:
+        str_replace:
+          template: stack-iscsi
+          params:
+            stack: { get_param: "OS::stack_name" }
+      flavor: 2 GB General Purpose v1
+      image: { get_param: server_image }
+      networks:
+        - network: '00000000-0000-0000-0000-000000000000'
+        - network: '11111111-1111-1111-1111-111111111111'
+        - port: { get_resource: storage_server_port }
+      key_name: { get_param: ssh_key }
+      software_config_transport: POLL_TEMP_URL
+      user_data_format: SOFTWARE_CONFIG
+  cluster_server_1:
+    type: OS::Nova::Server
+    properties:
+      name:
+        str_replace:
+          template: stack-node1
+          params:
+            stack: { get_param: "OS::stack_name" }
+      flavor: 2 GB General Purpose v1
+      image: { get_param: server_image }
+      networks:
+        - network: '00000000-0000-0000-0000-000000000000'
+        - network: '11111111-1111-1111-1111-111111111111'
+        - port: { get_resource: cluster_server_1_port }
+      key_name: { get_param: ssh_key }
+      software_config_transport: POLL_TEMP_URL
+      user_data_format: SOFTWARE_CONFIG
+  cluster_server_2:
+    type: OS::Nova::Server
+    properties:
+      name:
+        str_replace:
+          template: stack-node2
+          params:
+            stack: { get_param: "OS::stack_name" }
+      flavor: 2 GB General Purpose v1
+      image: { get_param: server_image }
+      networks:
+        - network: '00000000-0000-0000-0000-000000000000'
+        - network: '11111111-1111-1111-1111-111111111111'
+        - port: { get_resource: cluster_server_2_port }
+      key_name: { get_param: ssh_key }
+      software_config_transport: POLL_TEMP_URL
+      user_data_format: SOFTWARE_CONFIG
+
+outputs:
+  storage_server_ip:
+    description: IP of the storage server
+    value: { get_attr: [ server_storage, addresses, public, 0, port ] }
+  cluster_server_1_ip:
+    description: IP of cluster node 1
+    value: { get_attr: [ cluster_server_1, addresses, public, 0, port ] }
+  cluster_server_2_ip:
+    description: IP of cluster node 2
+    value: { get_attr: [ cluster_server_2, addresses, public, 0, port ] }
+  storage_server_deploy_output:
+    description: stdout from storage server deployment
+    value: { get_attr: [ storage_server_deployment, deploy_stdout ] }
+  storage_server_deploy_errors:
+    description: stderr from storage server deployment
+    value: { get_attr: [ storage_server_deployment, deploy_stderr ] }
+  cluster_servers_deploy_output:
+    description: stdout from cluster server deployments
+    value: { get_attr: [ cluster_servers_deployment, deploy_stdouts ] }
+  cluster_servers_deploy_errors:
+    description: stderr from cluster server deployments
+    value: { get_attr: [ cluster_servers_deployment, deploy_stderrs ] }
